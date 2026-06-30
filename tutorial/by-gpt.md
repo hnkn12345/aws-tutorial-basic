@@ -1750,147 +1750,455 @@ infra/github_oidc.tf
 
 この章では、AWS の権限管理である IAM を Terraform で定義します。
 
+この章も、作業はすべて **ローカルPC** で行います。
+AWS Console で IAM Role を手作業作成するのではなく、Terraform ファイルとして作成します。
+
 ## 作業場所
 
-```text
+```text id="0tdt52"
 ローカルPC
 ```
 
-## 対象ファイル
+## 対象ディレクトリ
 
-```text
+```text id="wvud03"
+terraform-aws-cicd-tutorial/infra/
+```
+
+## 作るファイル
+
+```text id="2xciuy"
 infra/iam.tf
 infra/github_oidc.tf
 ```
 
-## AWS Console でやること
+## この章で作る IAM リソース
 
-基本的にはありません。
-IAM Role や IAM Policy も Terraform で作ります。
-
-## この章で作る IAM Role
-
-```text
+```text id="lo56sc"
 EC2 Instance Role
+EC2 Instance Profile
+EC2用 S3 Artifact 読み取りポリシー
 CodeDeploy Service Role
+GitHub Actions OIDC Provider
 GitHub Actions Role
+GitHub Actions用 S3 / CodeDeploy 操作ポリシー
 ```
+
+## なぜ IAM が必要か
+
+今回の構成では、複数のサービスが AWS リソースを操作します。
+
+```text id="ogmzau"
+EC2:
+  SSM Session Manager を使う
+  CodeDeploy Agent として動く
+  S3 からデプロイ成果物を取得する
+
+CodeDeploy:
+  EC2 / Auto Scaling Group / ALB と連携してデプロイする
+
+GitHub Actions:
+  S3 に revision.zip をアップロードする
+  CodeDeploy の deployment を作成する
+```
+
+そのため、それぞれに適切な IAM Role を付けます。
 
 ---
 
-## 9-2. EC2 Instance Role
+# 9-2. IAM の全体像
 
-## 作業場所
+この章で作る Role は3種類です。
 
-```text
-ローカルPC
+```text id="oxue34"
+1. EC2 Instance Role
+2. CodeDeploy Service Role
+3. GitHub Actions Role
 ```
 
-## 対象ファイル
+それぞれの役割は以下です。
 
-```text
-infra/iam.tf
+```text id="wx7yg0"
+EC2 Instance Role:
+  EC2自身が使う権限。
+  SSMやS3 artifact取得に使う。
+
+CodeDeploy Service Role:
+  CodeDeployサービス自身が使う権限。
+  EC2 / ASG / ALB などを扱うために使う。
+
+GitHub Actions Role:
+  GitHub Actions が OIDC 経由で引き受ける権限。
+  S3 upload と CodeDeploy 実行に使う。
 ```
 
-## 目的
+図で表すと以下です。
 
-EC2 が AWS サービスを使うための Role を作ります。
-
-EC2 には、以下の権限が必要です。
-
-```text
-SSM Session Manager を使う
-CodeDeploy Agent として動作する
-S3 から artifact zip を取得する
-```
-
-この Role は、Launch Template 経由で EC2 に付与します。
-
-```text
-Launch Template
+```text id="c2vfcx"
+GitHub Actions
+  ↓ OIDC
+GitHub Actions Role
   ↓
-IAM Instance Profile
-  ↓
-EC2 Instance Role
-  ↓
-EC2
-```
+S3 / CodeDeploy
 
-EC2 の中にアクセスキーを置くのではありません。
-EC2 に IAM Role を付けることで、一時的な認証情報を使えるようにします。
 
----
-
-## 9-3. CodeDeploy Service Role
-
-## 作業場所
-
-```text
-ローカルPC
-```
-
-## 対象ファイル
-
-```text
-infra/iam.tf
-```
-
-## 目的
-
-CodeDeploy が AWS リソースを操作するための Role を作ります。
-
-CodeDeploy は、デプロイ時に以下を扱います。
-
-```text
-Auto Scaling Group
-EC2
-ALB
-Target Group
-Deployment 状態
-```
-
-つまり、CodeDeploy 自身にも AWS を操作する権限が必要です。
-
-```text
 CodeDeploy
   ↓ assume role
 CodeDeploy Service Role
   ↓
-EC2 / ASG / ALB を操作
+EC2 / ASG / ALB
+
+
+EC2
+  ↓ instance profile
+EC2 Instance Role
+  ↓
+SSM / S3
 ```
 
 ---
 
-## 9-4. GitHub Actions OIDC Role
+# 9-3. `iam.tf` を作る
 
 ## 作業場所
 
-```text
+```text id="zsxavl"
 ローカルPC
 ```
 
 ## 対象ファイル
 
-```text
+```text id="gjtl8z"
+infra/iam.tf
+```
+
+## 目的
+
+`iam.tf` では、以下を作ります。
+
+```text id="l5rldc"
+EC2 Instance Role
+EC2 Instance Profile
+EC2用 SSM 権限
+EC2用 S3 Artifact 読み取り権限
+CodeDeploy Service Role
+CodeDeploy用 AWS 管理ポリシー attachment
+```
+
+---
+
+## `infra/iam.tf`
+
+```hcl id="dsk1hp"
+# ============================================================
+# EC2 Instance Role
+# ============================================================
+
+data "aws_iam_policy_document" "ec2_assume_role" {
+  statement {
+    sid    = "AllowEC2AssumeRole"
+    effect = "Allow"
+
+    actions = [
+      "sts:AssumeRole"
+    ]
+
+    principals {
+      type = "Service"
+      identifiers = [
+        "ec2.amazonaws.com"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "ec2" {
+  name_prefix        = "${local.name_prefix}-ec2-"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ec2-role"
+  })
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name_prefix = "${local.name_prefix}-ec2-"
+  role        = aws_iam_role.ec2.name
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ec2-instance-profile"
+  })
+}
+
+# SSM Session Manager を使うためのAWS管理ポリシー
+resource "aws_iam_role_policy_attachment" "ec2_ssm_managed_instance_core" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+# EC2上のCodeDeploy AgentがS3 artifact bucketから成果物を取得するためのポリシー
+data "aws_iam_policy_document" "ec2_artifact_read" {
+  statement {
+    sid    = "AllowGetBucketLocation"
+    effect = "Allow"
+
+    actions = [
+      "s3:GetBucketLocation"
+    ]
+
+    resources = [
+      aws_s3_bucket.artifact.arn
+    ]
+  }
+
+  statement {
+    sid    = "AllowListArtifactBucket"
+    effect = "Allow"
+
+    actions = [
+      "s3:ListBucket"
+    ]
+
+    resources = [
+      aws_s3_bucket.artifact.arn
+    ]
+  }
+
+  statement {
+    sid    = "AllowReadArtifactObjects"
+    effect = "Allow"
+
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion"
+    ]
+
+    resources = [
+      "${aws_s3_bucket.artifact.arn}/*"
+    ]
+  }
+}
+
+resource "aws_iam_policy" "ec2_artifact_read" {
+  name_prefix = "${local.name_prefix}-ec2-artifact-read-"
+  description = "Allow EC2 instances to read CodeDeploy artifacts from S3"
+  policy      = data.aws_iam_policy_document.ec2_artifact_read.json
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-ec2-artifact-read"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ec2_artifact_read" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = aws_iam_policy.ec2_artifact_read.arn
+}
+
+
+# ============================================================
+# CodeDeploy Service Role
+# ============================================================
+
+data "aws_iam_policy_document" "codedeploy_assume_role" {
+  statement {
+    sid    = "AllowCodeDeployAssumeRole"
+    effect = "Allow"
+
+    actions = [
+      "sts:AssumeRole"
+    ]
+
+    principals {
+      type = "Service"
+      identifiers = [
+        "codedeploy.amazonaws.com"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "codedeploy" {
+  name_prefix        = "${local.name_prefix}-codedeploy-"
+  assume_role_policy = data.aws_iam_policy_document.codedeploy_assume_role.json
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-codedeploy-role"
+  })
+}
+
+# EC2/オンプレミス向けCodeDeployで使うAWS管理ポリシー
+resource "aws_iam_role_policy_attachment" "codedeploy_service_role" {
+  role       = aws_iam_role.codedeploy.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
+}
+```
+
+---
+
+# 9-4. `iam.tf` の解説
+
+## EC2 Instance Role
+
+EC2 Instance Role は、EC2 インスタンス自身に付与する Role です。
+
+```hcl id="8i41i7"
+resource "aws_iam_role" "ec2" {
+  name_prefix        = "${local.name_prefix}-ec2-"
+  assume_role_policy = data.aws_iam_policy_document.ec2_assume_role.json
+}
+```
+
+この Role を EC2 に直接付けるのではなく、Instance Profile 経由で付けます。
+
+```hcl id="0qn6v0"
+resource "aws_iam_instance_profile" "ec2" {
+  name_prefix = "${local.name_prefix}-ec2-"
+  role        = aws_iam_role.ec2.name
+}
+```
+
+第8章の `asg.tf` では、Launch Template からこの Instance Profile を参照しています。
+
+```hcl id="3uyy30"
+iam_instance_profile {
+  name = aws_iam_instance_profile.ec2.name
+}
+```
+
+つまり、つながりは以下です。
+
+```text id="el2q88"
+aws_iam_role.ec2
+  ↓
+aws_iam_instance_profile.ec2
+  ↓
+aws_launch_template.app
+  ↓
+EC2
+```
+
+---
+
+## SSM Session Manager 用権限
+
+EC2 に SSH で入る代わりに、SSM Session Manager を使えるようにします。
+
+そのために、EC2 Role に `AmazonSSMManagedInstanceCore` を付けます。
+
+```hcl id="u8nbly"
+resource "aws_iam_role_policy_attachment" "ec2_ssm_managed_instance_core" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+```
+
+この教材では、Security Group で SSH 22番を開けません。
+
+```text id="zozlwp"
+開けない:
+  TCP 22 from 0.0.0.0/0
+```
+
+必要な場合は、Session Manager で接続します。
+
+---
+
+## S3 Artifact 読み取り権限
+
+GitHub Actions は、アプリのビルド成果物を S3 にアップロードします。
+
+```text id="agsymt"
+GitHub Actions
+  ↓
+S3 Artifact Bucket
+```
+
+その後、CodeDeploy Agent が EC2 上で artifact を取得します。
+
+```text id="cu8adl"
+EC2上のCodeDeploy Agent
+  ↓
+S3 Artifact Bucket から revision.zip を取得
+```
+
+そのため、EC2 Role には S3 から成果物を読む権限が必要です。
+
+```hcl id="k49ymv"
+actions = [
+  "s3:GetObject",
+  "s3:GetObjectVersion"
+]
+```
+
+対象は、チュートリアル用の artifact bucket のみに絞っています。
+
+```hcl id="s31bu5"
+resources = [
+  "${aws_s3_bucket.artifact.arn}/*"
+]
+```
+
+---
+
+## CodeDeploy Service Role
+
+CodeDeploy Service Role は、CodeDeploy サービス自身が AWS リソースを操作するために使います。
+
+```hcl id="o6g6gb"
+resource "aws_iam_role" "codedeploy" {
+  name_prefix        = "${local.name_prefix}-codedeploy-"
+  assume_role_policy = data.aws_iam_policy_document.codedeploy_assume_role.json
+}
+```
+
+CodeDeploy は、この Role を使って EC2 や Auto Scaling Group と連携します。
+
+```text id="neknf8"
+CodeDeploy
+  ↓ assume role
+CodeDeploy Service Role
+  ↓
+EC2 / ASG / ALB
+```
+
+この Role には、AWS 管理ポリシー `AWSCodeDeployRole` を付けます。
+
+```hcl id="k5v04j"
+policy_arn = "arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole"
+```
+
+---
+
+# 9-5. `github_oidc.tf` を作る
+
+## 作業場所
+
+```text id="a4yfst"
+ローカルPC
+```
+
+## 対象ファイル
+
+```text id="zp5p40"
 infra/github_oidc.tf
 ```
 
 ## 目的
 
-GitHub Actions から AWS を操作するための Role を作ります。
+`github_oidc.tf` では、GitHub Actions から AWS を操作するための Role を作ります。
 
-この教材では、GitHub Secrets に AWS の長期アクセスキーを置きません。
+この教材では、GitHub Secrets に AWS の長期アクセスキーを保存しません。
 
 使わないもの:
 
-```text
+```text id="4b3fwg"
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 ```
 
-代わりに OIDC を使います。
+代わりに、GitHub Actions OIDC を使います。
 
-```text
+```text id="hg5xwn"
 GitHub Actions
   ↓ OIDC
 AWS IAM Role
@@ -1898,21 +2206,433 @@ AWS IAM Role
 S3 upload / CodeDeploy create-deployment
 ```
 
-GitHub Actions Role に許可する操作は、主に以下です。
+---
 
-```text
-S3 に revision.zip をアップロードする
-CodeDeploy の deployment を作成する
-CodeDeploy の結果を確認する
-```
+## `infra/github_oidc.tf`
 
-この Role は、特定の GitHub リポジトリからだけ使えるように制限します。
+```hcl id="y5lkhw"
+# ============================================================
+# GitHub Actions OIDC Provider
+# ============================================================
 
-```text
-repo:<github_owner>/<github_repo>:ref:refs/heads/main
+resource "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+
+  client_id_list = [
+    "sts.amazonaws.com"
+  ]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-github-oidc"
+  })
+}
+
+
+# ============================================================
+# GitHub Actions Role
+# ============================================================
+
+data "aws_iam_policy_document" "github_actions_assume_role" {
+  statement {
+    sid    = "AllowGitHubActionsAssumeRole"
+    effect = "Allow"
+
+    actions = [
+      "sts:AssumeRoleWithWebIdentity"
+    ]
+
+    principals {
+      type = "Federated"
+      identifiers = [
+        aws_iam_openid_connect_provider.github.arn
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+
+      values = [
+        "sts.amazonaws.com"
+      ]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+
+      values = [
+        "repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/main"
+      ]
+    }
+  }
+}
+
+resource "aws_iam_role" "github_actions" {
+  name_prefix        = "${local.name_prefix}-gha-"
+  assume_role_policy = data.aws_iam_policy_document.github_actions_assume_role.json
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-github-actions-role"
+  })
+}
+
+
+# ============================================================
+# GitHub Actions Permissions
+# ============================================================
+
+data "aws_iam_policy_document" "github_actions_deploy" {
+  statement {
+    sid    = "AllowReadArtifactBucketMetadata"
+    effect = "Allow"
+
+    actions = [
+      "s3:GetBucketLocation",
+      "s3:ListBucket"
+    ]
+
+    resources = [
+      aws_s3_bucket.artifact.arn
+    ]
+  }
+
+  statement {
+    sid    = "AllowUploadDeploymentArtifacts"
+    effect = "Allow"
+
+    actions = [
+      "s3:PutObject",
+      "s3:AbortMultipartUpload"
+    ]
+
+    resources = [
+      "${aws_s3_bucket.artifact.arn}/revisions/*"
+    ]
+  }
+
+  statement {
+    sid    = "AllowCreateAndCheckCodeDeployDeployment"
+    effect = "Allow"
+
+    actions = [
+      "codedeploy:CreateDeployment",
+      "codedeploy:GetDeployment",
+      "codedeploy:GetDeploymentConfig",
+      "codedeploy:GetApplication",
+      "codedeploy:GetDeploymentGroup",
+      "codedeploy:ListDeployments"
+    ]
+
+    resources = [
+      "*"
+    ]
+  }
+}
+
+resource "aws_iam_policy" "github_actions_deploy" {
+  name_prefix = "${local.name_prefix}-gha-deploy-"
+  description = "Allow GitHub Actions to upload artifacts and create CodeDeploy deployments"
+  policy      = data.aws_iam_policy_document.github_actions_deploy.json
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-github-actions-deploy"
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "github_actions_deploy" {
+  role       = aws_iam_role.github_actions.name
+  policy_arn = aws_iam_policy.github_actions_deploy.arn
+}
 ```
 
 ---
+
+# 9-6. `github_oidc.tf` の解説
+
+## OIDC Provider
+
+まず、AWS 側に GitHub Actions の OIDC Provider を登録します。
+
+```hcl id="3zpukd"
+resource "aws_iam_openid_connect_provider" "github" {
+  url = "https://token.actions.githubusercontent.com"
+
+  client_id_list = [
+    "sts.amazonaws.com"
+  ]
+}
+```
+
+これは、AWS に対して以下を教える設定です。
+
+```text id="zrw794"
+GitHub Actions から発行された OIDC Token を信頼候補として扱う
+```
+
+ただし、OIDC Provider を作っただけでは、どのリポジトリからでも AWS を操作できるわけではありません。
+
+次の Trust Policy で、対象リポジトリとブランチを制限します。
+
+---
+
+## GitHub Actions Role の Trust Policy
+
+GitHub Actions Role の信頼ポリシーでは、次の2つを確認します。
+
+```text id="wy5xi1"
+aud:
+  sts.amazonaws.com であること
+
+sub:
+  指定した GitHub リポジトリの main ブランチであること
+```
+
+該当箇所は以下です。
+
+```hcl id="xa6sal"
+condition {
+  test     = "StringEquals"
+  variable = "token.actions.githubusercontent.com:aud"
+
+  values = [
+    "sts.amazonaws.com"
+  ]
+}
+```
+
+```hcl id="pg8sp9"
+condition {
+  test     = "StringEquals"
+  variable = "token.actions.githubusercontent.com:sub"
+
+  values = [
+    "repo:${var.github_owner}/${var.github_repo}:ref:refs/heads/main"
+  ]
+}
+```
+
+つまり、この Role を引き受けられるのは以下だけです。
+
+```text id="vh1i3d"
+GitHub owner:
+  var.github_owner
+
+GitHub repo:
+  var.github_repo
+
+branch:
+  main
+```
+
+例:
+
+```text id="qbqv8r"
+repo:example-user/terraform-aws-cicd-tutorial:ref:refs/heads/main
+```
+
+---
+
+## GitHub Actions に許可するS3操作
+
+GitHub Actions は、ビルドした `revision.zip` を S3 にアップロードします。
+
+そのため、以下の権限を付けます。
+
+```hcl id="v3jd92"
+actions = [
+  "s3:PutObject",
+  "s3:AbortMultipartUpload"
+]
+```
+
+アップロード先は、artifact bucket の `revisions/` 配下だけに絞ります。
+
+```hcl id="d7u5a6"
+resources = [
+  "${aws_s3_bucket.artifact.arn}/revisions/*"
+]
+```
+
+GitHub Actions からアップロードするパスは、後続の workflow で以下のようにします。
+
+```text id="acycru"
+revisions/<commit-sha>.zip
+```
+
+---
+
+## GitHub Actions に許可する CodeDeploy 操作
+
+GitHub Actions は、S3 に zip を置いたあと、CodeDeploy deployment を作成します。
+
+そのため、以下の権限を付けます。
+
+```hcl id="4zbh2g"
+actions = [
+  "codedeploy:CreateDeployment",
+  "codedeploy:GetDeployment",
+  "codedeploy:GetDeploymentConfig",
+  "codedeploy:GetApplication",
+  "codedeploy:GetDeploymentGroup",
+  "codedeploy:ListDeployments"
+]
+```
+
+この教材では、CodeDeploy 操作の `resources` は `*` にしています。
+
+```hcl id="15wq3y"
+resources = [
+  "*"
+]
+```
+
+理由は、CodeDeploy の一部操作や `deploymentId` を使う確認処理では、リソース単位の制限がやや複雑になるためです。
+
+実務では、対象の Application / Deployment Group に絞ることを検討します。
+
+---
+
+# 9-7. 既存の GitHub OIDC Provider がある場合
+
+AWS アカウント内に、すでに GitHub Actions 用の OIDC Provider が存在する場合があります。
+
+その場合、Terraform apply 時に以下のようなエラーになる可能性があります。
+
+```text id="wv83c7"
+EntityAlreadyExists:
+Provider with url https://token.actions.githubusercontent.com already exists.
+```
+
+学習用の新規アカウントでは、そのまま作成して問題ありません。
+
+既存アカウントでこのエラーが出た場合は、次のどちらかで対応します。
+
+```text id="p81e1m"
+対応1:
+  既存の OIDC Provider を terraform import する
+
+対応2:
+  data source で既存の OIDC Provider を参照する
+```
+
+初心者向けチュートリアルでは、まず新規アカウントまたは学習用アカウントで進める方が分かりやすいです。
+
+---
+
+# 9-8. 第9章終了時点の確認
+
+第9章終了時点で、以下のファイルが追加されています。
+
+```text id="n2mjcl"
+infra/
+├── iam.tf
+└── github_oidc.tf
+```
+
+第8章までのファイルと合わせると、ここまでで以下ができています。
+
+```text id="z8yrqy"
+infra/
+├── versions.tf
+├── variables.tf
+├── outputs.tf
+├── network.tf
+├── security_group.tf
+├── s3.tf
+├── alb.tf
+├── asg.tf
+├── iam.tf
+└── github_oidc.tf
+```
+
+第8章で `asg.tf` が参照していた以下のリソースは、この章で定義されました。
+
+```hcl id="z4xjfh"
+aws_iam_instance_profile.ec2
+```
+
+そのため、`asg.tf` の以下の参照は解決されます。
+
+```hcl id="ic82z3"
+iam_instance_profile {
+  name = aws_iam_instance_profile.ec2.name
+}
+```
+
+---
+
+# 9-9. まだ `terraform plan` しない理由
+
+第9章までで IAM 周りはかなり揃いました。
+
+ただし、まだ `terraform plan` や `terraform validate` は実行しません。
+
+理由は、前の章で作った `outputs.tf` が、まだ作成していない CodeDeploy リソースを参照しているためです。
+
+まだ存在しない参照:
+
+```text id="v87sot"
+aws_codedeploy_app.app
+aws_codedeploy_deployment_group.app
+```
+
+これらは後続の `codedeploy.tf` で作ります。
+
+つまり、現時点では以下の状態です。
+
+```text id="59r3vj"
+作成済み:
+  network.tf
+  security_group.tf
+  s3.tf
+  alb.tf
+  asg.tf
+  iam.tf
+  github_oidc.tf
+
+まだ必要:
+  codedeploy.tf の具体実装
+```
+
+`terraform plan` を実行するのは、`codedeploy.tf` まで完成してからです。
+
+---
+
+# 9-10. 第9章で理解すべきこと
+
+この章のポイントは、以下です。
+
+```text id="peyw2c"
+EC2にはアクセスキーを置かない。
+EC2にはIAM Instance Profileを付ける。
+
+GitHub SecretsにAWSアクセスキーを置かない。
+GitHub ActionsはOIDCでIAM Roleを引き受ける。
+
+CodeDeployにはService Roleが必要。
+CodeDeployはそのRoleでEC2 / ASG / ALBと連携する。
+
+S3 artifact bucketへのアクセス権限は、
+EC2用とGitHub Actions用で分ける。
+```
+
+特に重要なのは、以下の分離です。
+
+```text id="pnyf36"
+EC2 Role:
+  S3からartifactを読む
+
+GitHub Actions Role:
+  S3へartifactを書く
+  CodeDeployを起動する
+
+CodeDeploy Role:
+  デプロイ対象のEC2 / ASG / ALBと連携する
+```
+
+この分離ができていると、後続の GitHub Actions と CodeDeploy の流れが理解しやすくなります。
+
 
 # 10. EC2 起動時に入れるもの
 
