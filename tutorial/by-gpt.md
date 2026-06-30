@@ -934,9 +934,19 @@ infra/network.tf
 
 ## 目的
 
-VPC、Subnet、Internet Gateway、Route Table を作ります。
+このファイルでは、AWS 上の基本ネットワークを作ります。
 
-オンプレでいうと、以下を作るイメージです。
+作るものは以下です。
+
+```text
+VPC
+Public Subnet x 2
+Internet Gateway
+Route Table
+Route Table Association
+```
+
+オンプレでいうと、以下をコードで作るイメージです。
 
 ```text
 社内ネットワーク
@@ -945,7 +955,7 @@ VPC、Subnet、Internet Gateway、Route Table を作ります。
 ルーティング設定
 ```
 
-このチュートリアルでは、学習しやすさを優先し、Public Subnet を2つ作ります。
+このチュートリアルでは、学習しやすさを優先して Public Subnet を2つ作ります。
 
 ```text
 VPC
@@ -953,17 +963,119 @@ VPC
 └── Public Subnet C
 ```
 
-本番では EC2 を Private Subnet に置く構成が一般的ですが、最初から NAT Gateway や VPC Endpoint まで入れると複雑になるため、この教材では次の方針にします。
+本番では EC2 を Private Subnet に置くことが多いですが、最初から NAT Gateway や VPC Endpoint まで入れると複雑になるため、今回は以下の方針にします。
 
 ```text
-EC2はPublic Subnetに置く
-ただしSSHは開けない
-EC2へのアプリ通信はALBからのみ許可する
+EC2 は Public Subnet に置く
+ただし SSH は開けない
+EC2 へのアプリ通信は ALB からのみ許可する
 ```
 
 ---
 
-## 8-7. `security_group.tf` を作る
+## `infra/network.tf`
+
+```hcl
+locals {
+  name_prefix = var.project
+
+  common_tags = {
+    Project   = var.project
+    ManagedBy = "Terraform"
+  }
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-vpc"
+  })
+}
+
+resource "aws_subnet" "public" {
+  count = 2
+
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(aws_vpc.main.cidr_block, 8, count.index + 1)
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-${count.index + 1}"
+  })
+}
+
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-igw"
+  })
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-public-rt"
+  })
+}
+
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.main.id
+}
+
+resource "aws_route_table_association" "public" {
+  count = length(aws_subnet.public)
+
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+```
+
+---
+
+## このファイルで重要な点
+
+`aws_subnet.public` は `count = 2` で2つ作っています。
+
+```hcl
+count = 2
+```
+
+CIDR は `cidrsubnet` で分割しています。
+
+```hcl
+cidrsubnet(aws_vpc.main.cidr_block, 8, count.index + 1)
+```
+
+結果として、おおよそ以下のようなサブネットになります。
+
+```text
+10.0.1.0/24
+10.0.2.0/24
+```
+
+Availability Zone も2つ使います。
+
+```hcl
+availability_zone = data.aws_availability_zones.available.names[count.index]
+```
+
+これにより、後で ALB や Auto Scaling Group を複数 AZ にまたがって配置できます。
+
+---
+
+# 8-7. `security_group.tf` を作る
 
 ## 作業場所
 
@@ -979,42 +1091,127 @@ infra/security_group.tf
 
 ## 目的
 
-ALB 用と EC2 用の Security Group を作ります。
+このファイルでは、ALB 用と EC2 用の Security Group を作ります。
 
 作る Security Group は2つです。
 
 ```text
 ALB Security Group
-EC2 Security Group
+EC2 App Security Group
 ```
 
-許可する通信は以下です。
+通信の流れは以下です。
 
 ```text
 Internet
-  -> ALB
-     TCP 80
-
+  ↓ TCP 80
 ALB
-  -> EC2
-     TCP 8080
+  ↓ TCP 8080
+EC2
 ```
 
-SSH は開けません。
-
-悪い例:
+このチュートリアルでは SSH は開けません。
 
 ```text
-TCP 22 from 0.0.0.0/0
+開けない:
+  TCP 22 from 0.0.0.0/0
 ```
 
-この教材では、これは使いません。
-
-EC2 に入る必要がある場合は、SSM Session Manager を使います。
+EC2 にログインしたい場合は、後続で SSM Session Manager を使います。
 
 ---
 
-## 8-8. `s3.tf` を作る
+## `infra/security_group.tf`
+
+```hcl
+resource "aws_security_group" "alb" {
+  name_prefix = "${local.name_prefix}-alb-"
+  description = "Security group for ALB"
+  vpc_id      = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-alb-sg"
+  })
+}
+
+resource "aws_security_group" "app" {
+  name_prefix = "${local.name_prefix}-app-"
+  description = "Security group for application EC2 instances"
+  vpc_id      = aws_vpc.main.id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-app-sg"
+  })
+}
+
+# Internet -> ALB : HTTP
+resource "aws_vpc_security_group_ingress_rule" "alb_http_ipv4" {
+  security_group_id = aws_security_group.alb.id
+  description       = "Allow HTTP from the internet"
+
+  ip_protocol = "tcp"
+  from_port   = 80
+  to_port     = 80
+  cidr_ipv4   = "0.0.0.0/0"
+}
+
+# ALB -> Internet : outbound
+resource "aws_vpc_security_group_egress_rule" "alb_all_outbound_ipv4" {
+  security_group_id = aws_security_group.alb.id
+  description       = "Allow all outbound traffic from ALB"
+
+  ip_protocol = "-1"
+  cidr_ipv4   = "0.0.0.0/0"
+}
+
+# ALB -> EC2 : application port
+resource "aws_vpc_security_group_ingress_rule" "app_from_alb" {
+  security_group_id = aws_security_group.app.id
+  description       = "Allow application traffic from ALB"
+
+  ip_protocol                  = "tcp"
+  from_port                    = 8080
+  to_port                      = 8080
+  referenced_security_group_id = aws_security_group.alb.id
+}
+
+# EC2 -> Internet : outbound
+resource "aws_vpc_security_group_egress_rule" "app_all_outbound_ipv4" {
+  security_group_id = aws_security_group.app.id
+  description       = "Allow all outbound traffic from application instances"
+
+  ip_protocol = "-1"
+  cidr_ipv4   = "0.0.0.0/0"
+}
+```
+
+---
+
+## このファイルで重要な点
+
+EC2 側の Security Group は、インターネット全体からのアクセスを許可していません。
+
+許可しているのは、ALB の Security Group から来た TCP 8080 だけです。
+
+```hcl
+referenced_security_group_id = aws_security_group.alb.id
+```
+
+つまり、EC2 が Public Subnet にあっても、アプリには ALB 経由でしか入れない構成にしています。
+
+オンプレでいうと、以下に近いです。
+
+```text
+外部公開:
+  ロードバランサだけ
+
+アプリサーバー:
+  ロードバランサからの通信だけ許可
+```
+
+---
+
+# 8-8. `s3.tf` を作る
 
 ## 作業場所
 
@@ -1030,7 +1227,7 @@ infra/s3.tf
 
 ## 目的
 
-GitHub Actions が作成したアプリの zip ファイルを置く S3 バケットを作ります。
+このファイルでは、GitHub Actions が作成したアプリの zip ファイルを保存する S3 バケットを作ります。
 
 この S3 バケットは、デプロイ成果物置き場です。
 
@@ -1042,19 +1239,86 @@ revision.zip
 S3 Artifact Bucket
   ↓
 CodeDeploy
+  ↓
+EC2
 ```
 
-成果物は、たとえば以下のようなキーで保存します。
+成果物は、後で GitHub Actions によって以下のようなパスに保存されます。
 
 ```text
 revisions/<commit-sha>.zip
 ```
 
-これにより、どの Git commit から作られた成果物か追いやすくなります。
+---
+
+## `infra/s3.tf`
+
+```hcl
+resource "aws_s3_bucket" "artifact" {
+  bucket_prefix = "${local.name_prefix}-artifact-"
+
+  # チュートリアルでは destroy しやすいように true にする。
+  # 実務では誤削除防止のため、要件に応じて false も検討する。
+  force_destroy = true
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-artifact"
+  })
+}
+
+resource "aws_s3_bucket_public_access_block" "artifact" {
+  bucket = aws_s3_bucket.artifact.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "artifact" {
+  bucket = aws_s3_bucket.artifact.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "artifact" {
+  bucket = aws_s3_bucket.artifact.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+```
 
 ---
 
-## 8-9. `alb.tf` を作る
+## このファイルで重要な点
+
+`bucket_prefix` を使っているため、S3 バケット名は Terraform 実行時に一意な名前で作られます。
+
+```hcl
+bucket_prefix = "${local.name_prefix}-artifact-"
+```
+
+S3 バケット名は全世界で一意である必要があるため、固定名にすると他の人と衝突する可能性があります。
+
+チュートリアルでは、削除しやすくするために `force_destroy = true` にしています。
+
+```hcl
+force_destroy = true
+```
+
+これは、バケット内に zip ファイルが残っていても `terraform destroy` で削除しやすくするためです。
+
+ただし、実務では誤削除防止のため、安易に `true` にしない方がよい場合があります。
+
+---
+
+# 8-9. `alb.tf` を作る
 
 ## 作業場所
 
@@ -1070,35 +1334,136 @@ infra/alb.tf
 
 ## 目的
 
-Application Load Balancer、Target Group、Listener を作ります。
+このファイルでは、Application Load Balancer を作ります。
 
-ALB は、外部からの HTTP アクセスを受ける入口です。
+作るものは以下です。
+
+```text
+ALB
+Target Group
+Listener
+```
+
+通信の流れは以下です。
 
 ```text
 Internet
-  ↓
+  ↓ HTTP 80
 ALB
-  ↓
+  ↓ HTTP 8080
 Target Group
   ↓
 EC2
 ```
 
-オンプレでいうと、L7ロードバランサに近いものです。
+---
 
-この教材では、HTTP 80番で受けます。
+## `infra/alb.tf`
 
-```text
-ブラウザ / curl
-  ↓
-http://<alb-dns-name>/
+```hcl
+resource "aws_lb" "app" {
+  name               = substr("${local.name_prefix}-alb", 0, 32)
+  internal           = false
+  load_balancer_type = "application"
+
+  security_groups = [
+    aws_security_group.alb.id
+  ]
+
+  subnets = aws_subnet.public[*].id
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-alb"
+  })
+}
+
+resource "aws_lb_target_group" "app" {
+  name = substr("${local.name_prefix}-tg", 0, 32)
+
+  vpc_id      = aws_vpc.main.id
+  target_type = "instance"
+
+  protocol = "HTTP"
+  port     = 8080
+
+  deregistration_delay = 30
+
+  health_check {
+    enabled             = true
+    protocol            = "HTTP"
+    path                = "/health"
+    matcher             = "200"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-tg"
+  })
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app.arn
+
+  protocol = "HTTP"
+  port     = 80
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app.arn
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-http-listener"
+  })
+}
 ```
-
-本番では HTTPS 化しますが、この教材では AWS 基礎と CI/CD の理解を優先し、まず HTTP で進めます。
 
 ---
 
-## 8-10. `asg.tf` を作る
+## このファイルで重要な点
+
+ALB はインターネットから HTTP 80 番でアクセスを受けます。
+
+```hcl
+port     = 80
+protocol = "HTTP"
+```
+
+一方、EC2 上の Go アプリは 8080 番で待ち受けます。
+
+```hcl
+port = 8080
+```
+
+ALB の health check は `/health` を見ます。
+
+```hcl
+path    = "/health"
+matcher = "200"
+```
+
+つまり、アプリが次を返せば正常です。
+
+```text
+GET /health -> HTTP 200
+```
+
+この `/health` は、CodeDeploy の `validate.sh` でも使います。
+
+```text
+ALB:
+  外から見て正常か確認する
+
+CodeDeploy:
+  デプロイ後にEC2上で正常か確認する
+```
+
+---
+
+# 8-10. `asg.tf` を作る
 
 ## 作業場所
 
@@ -1114,39 +1479,270 @@ infra/asg.tf
 
 ## 目的
 
-Launch Template と Auto Scaling Group を作ります。
+このファイルでは、EC2 を直接作るのではなく、Launch Template と Auto Scaling Group を作ります。
 
-Launch Template は、EC2 をどう起動するかのテンプレートです。
+作るものは以下です。
 
 ```text
-AMI
-instance type
-IAM role
-Security Group
-user_data
+Amazon Linux 2023 AMI の参照
+Launch Template
+Auto Scaling Group
 ```
 
-Auto Scaling Group は、その Launch Template を使って EC2 の台数を維持します。
+オンプレでいうと、以下に近いです。
 
 ```text
-desired_capacity = 1
-min_size         = 1
-max_size         = 2
+サーバー構築手順書
+  +
+必要台数を維持する仕組み
 ```
 
-この教材では、まず1台構成で動かします。
+EC2 を1台だけ手作業で作るのではなく、Auto Scaling Group に管理させるのがポイントです。
 
-ただし、EC2を手動で作るのではなく、Auto Scaling Group に管理させるのがポイントです。
+---
+
+## 重要な注意
+
+この `asg.tf` は、後続の第9章で作る IAM Role を参照します。
+
+具体的には、以下です。
+
+```hcl
+aws_iam_instance_profile.ec2.name
+```
+
+そのため、8章を書いた直後に `terraform validate` や `terraform plan` を実行すると、まだ第9章の IAM ファイルがないため失敗します。
+
+この時点では、まずファイルを作るだけです。
+
+実行タイミングは以下です。
 
 ```text
-悪い学習構成:
-  EC2を1台だけ手作業で作る
+8章:
+  Terraformファイルを作る
 
-この教材の構成:
-  Launch Template + Auto Scaling GroupでEC2を管理する
+9章:
+  IAMファイルを作る
+
+11章以降:
+  GitHub Actions設定まで終わったら terraform plan / apply する
 ```
 
 ---
+
+## `infra/asg.tf`
+
+```hcl
+data "aws_ssm_parameter" "al2023_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+}
+
+resource "aws_launch_template" "app" {
+  name_prefix = "${local.name_prefix}-lt-"
+
+  image_id      = data.aws_ssm_parameter.al2023_ami.value
+  instance_type = "t3.micro"
+
+  vpc_security_group_ids = [
+    aws_security_group.app.id
+  ]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.ec2.name
+  }
+
+  metadata_options {
+    http_endpoint = "enabled"
+    http_tokens   = "required"
+  }
+
+  credit_specification {
+    cpu_credits = "standard"
+  }
+
+  block_device_mappings {
+    device_name = "/dev/xvda"
+
+    ebs {
+      volume_size           = 8
+      volume_type           = "gp3"
+      encrypted             = true
+      delete_on_termination = true
+    }
+  }
+
+  user_data = base64encode(<<-EOF
+    #!/bin/bash
+    set -eux
+
+    dnf update -y
+    dnf install -y ruby wget curl
+
+    cd /tmp
+
+    wget https://aws-codedeploy-${var.aws_region}.s3.${var.aws_region}.amazonaws.com/latest/install
+    chmod +x ./install
+    ./install auto
+
+    systemctl enable --now codedeploy-agent
+    systemctl status codedeploy-agent --no-pager || true
+  EOF
+  )
+
+  tag_specifications {
+    resource_type = "instance"
+
+    tags = merge(local.common_tags, {
+      Name = "${local.name_prefix}-app"
+    })
+  }
+
+  tag_specifications {
+    resource_type = "volume"
+
+    tags = merge(local.common_tags, {
+      Name = "${local.name_prefix}-app-volume"
+    })
+  }
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-lt"
+  })
+}
+
+resource "aws_autoscaling_group" "app" {
+  name_prefix = "${local.name_prefix}-asg-"
+
+  vpc_zone_identifier = aws_subnet.public[*].id
+
+  desired_capacity = 1
+  min_size         = 1
+  max_size         = 2
+
+  health_check_type         = "ELB"
+  health_check_grace_period = 300
+
+  target_group_arns = [
+    aws_lb_target_group.app.arn
+  ]
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name_prefix}-app"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Project"
+    value               = var.project
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "ManagedBy"
+    value               = "Terraform"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+---
+
+## このファイルで重要な点
+
+EC2 の AMI は、AMI ID を直接固定せず、SSM Parameter Store から Amazon Linux 2023 の最新 AMI を取得します。
+
+```hcl
+data "aws_ssm_parameter" "al2023_ami" {
+  name = "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+}
+```
+
+EC2 には、Security Group と IAM Instance Profile を付けます。
+
+```hcl
+vpc_security_group_ids = [
+  aws_security_group.app.id
+]
+
+iam_instance_profile {
+  name = aws_iam_instance_profile.ec2.name
+}
+```
+
+`user_data` では、CodeDeploy Agent をインストールします。
+
+```bash
+wget https://aws-codedeploy-${var.aws_region}.s3.${var.aws_region}.amazonaws.com/latest/install
+chmod +x ./install
+./install auto
+```
+
+このスクリプトは、ローカルPCで実行するものではありません。
+
+```text
+ローカルPC:
+  asg.tf に user_data として書く
+
+AWS:
+  EC2 起動時に cloud-init 経由で自動実行される
+```
+
+Auto Scaling Group は、ALB の Target Group に紐づけます。
+
+```hcl
+target_group_arns = [
+  aws_lb_target_group.app.arn
+]
+```
+
+これにより、ASG で起動した EC2 が ALB の振り分け先になります。
+
+---
+
+# 8章終了時点の確認
+
+8章終了時点で、以下のファイルができています。
+
+```text
+infra/
+├── versions.tf
+├── variables.tf
+├── outputs.tf
+├── network.tf
+├── security_group.tf
+├── s3.tf
+├── alb.tf
+└── asg.tf
+```
+
+ただし、この時点ではまだ `terraform plan` は実行しません。
+
+理由は、`asg.tf` が第9章で作る IAM リソースを参照しているためです。
+
+```text
+まだ存在しない参照:
+  aws_iam_instance_profile.ec2
+```
+
+次の第9章で、以下を作ります。
+
+```text
+infra/iam.tf
+infra/github_oidc.tf
+```
+
+第9章まで完了すると、`asg.tf` の IAM 参照が解決されます。
+
 
 # 9. IAM 設計
 
