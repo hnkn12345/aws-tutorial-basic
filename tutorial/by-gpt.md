@@ -2707,43 +2707,503 @@ AWS:
 
 ---
 
+# 10. EC2 起動時に入れるもの
+
+## 10-0. 先に `codedeploy.tf` を作る
+
+## 10-0-1. この節でやること
+
+第8章で ALB / Target Group / Auto Scaling Group を作りました。
+第9章で EC2 Role / CodeDeploy Service Role / GitHub Actions Role を作りました。
+
+しかし、まだ CodeDeploy 本体のリソースがありません。
+
+このままだと、以下が存在しません。
+
+```text id="bvhm6z"
+aws_codedeploy_app.app
+aws_codedeploy_deployment_group.app
+```
+
+そのため、`outputs.tf` の以下の参照も解決できません。
+
+```hcl id="ibsey6"
+aws_codedeploy_app.app.name
+aws_codedeploy_deployment_group.app.deployment_group_name
+```
+
+この節では、先に `infra/codedeploy.tf` を作成します。
+
+---
+
+## 作業場所
+
+```text id="xchot2"
+ローカルPC
+```
+
+## 対象ディレクトリ
+
+```text id="4gikkx"
+terraform-aws-cicd-tutorial/infra/
+```
+
+## 作るファイル
+
+```text id="yxmbf0"
+infra/codedeploy.tf
+```
+
+## この節で作るAWSリソース
+
+```text id="vrzx5l"
+CodeDeploy Application
+CodeDeploy Deployment Group
+```
+
+---
+
+## 10-0-2. 今回はまず in-place deployment にする
+
+この教材では、最初から Blue/Green にせず、まず **in-place deployment** で v1 → v2 の CI/CD を体験します。
+
+```text id="tfm6tr"
+in-place deployment:
+  既存のEC2上でアプリを入れ替える
+
+Blue/Green deployment:
+  新しい環境にアプリを入れて、あとからトラフィックを切り替える
+```
+
+理由は、いきなり Blue/Green まで入れると、以下が同時に出てきて初心者には重くなるためです。
+
+```text id="4yibd5"
+Green環境
+Auto Scaling Groupのコピー
+Target Group切り替え
+Traffic shifting
+Rollback設定
+Terraform stateとの境界
+```
+
+この章では、まず次を成立させます。
+
+```text id="zbonfq"
+GitHub Actions
+  ↓
+S3
+  ↓
+CodeDeploy
+  ↓
+Auto Scaling Group配下のEC2
+  ↓
+ALB経由で確認
+```
+
+Blue/Green は後続章で扱います。
+
+---
+
+## 10-0-3. 重要: ASG の health check 設定を一部修正する
+
+第8章の `asg.tf` では、以下のようにしていた場合があります。
+
+```hcl id="thetlw"
+health_check_type = "ELB"
+```
+
+しかし、この教材の初回デプロイでは、Terraform apply 直後の EC2 にはまだアプリが入っていません。
+
+つまり、初回デプロイ前は以下の状態です。
+
+```text id="aq5ceq"
+EC2は起動している
+CodeDeploy Agentは入っている
+でも tutorial-app はまだ動いていない
+/health もまだ返せない
+```
+
+この状態で ASG の health check を `ELB` にすると、ALB の `/health` が失敗し、初回デプロイ前に EC2 が不健康扱いになる可能性があります。
+
+そのため、この in-place 学習フェーズでは、`infra/asg.tf` の ASG を以下のようにします。
+
+```hcl id="pod31s"
+health_check_type         = "EC2"
+health_check_grace_period = 300
+```
+
+`aws_autoscaling_group.app` の該当箇所を確認し、必要なら修正してください。
+
+```hcl id="hwrzz8"
+resource "aws_autoscaling_group" "app" {
+  name_prefix = "${local.name_prefix}-asg-"
+
+  vpc_zone_identifier = aws_subnet.public[*].id
+
+  desired_capacity = 1
+  min_size         = 1
+  max_size         = 2
+
+  # 初回デプロイ前はアプリがまだ入っていないため、ここではEC2ヘルスチェックにする
+  health_check_type         = "EC2"
+  health_check_grace_period = 300
+
+  target_group_arns = [
+    aws_lb_target_group.app.arn
+  ]
+
+  launch_template {
+    id      = aws_launch_template.app.id
+    version = "$Latest"
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name_prefix}-app"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Project"
+    value               = var.project
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "ManagedBy"
+    value               = "Terraform"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+```
+
+ALB 自体の `/health` ヘルスチェックは残します。
+
+```text id="v2v16g"
+ALB:
+  /health でアプリ正常性を見る
+
+ASG:
+  この段階ではEC2自体の生存を見て台数維持する
+```
+
+後続の発展課題では、AMIにアプリを焼き込む、または起動直後にアプリを配置する方式にして、ASG側も `ELB` health check に寄せます。
+
+---
+
+## 10-0-4. `infra/codedeploy.tf` を作る
+
+`infra/codedeploy.tf` を作成します。
+
+```hcl id="xqz677"
+resource "aws_codedeploy_app" "app" {
+  name             = "${local.name_prefix}-app"
+  compute_platform = "Server"
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-codedeploy-app"
+  })
+}
+
+resource "aws_codedeploy_deployment_group" "app" {
+  app_name              = aws_codedeploy_app.app.name
+  deployment_group_name = "${local.name_prefix}-dg"
+  service_role_arn     = aws_iam_role.codedeploy.arn
+
+  # この教材の前半では、まず in-place deployment でCI/CDを体験する
+  deployment_style {
+    deployment_type   = "IN_PLACE"
+    deployment_option = "WITH_TRAFFIC_CONTROL"
+  }
+
+  # Auto Scaling Group 配下のEC2をデプロイ対象にする
+  autoscaling_groups = [
+    aws_autoscaling_group.app.name
+  ]
+
+  # ALB Target Group と連携し、デプロイ中のインスタンスを一時的に切り離す
+  load_balancer_info {
+    target_group_info {
+      name = aws_lb_target_group.app.name
+    }
+  }
+
+  # 1台ずつ更新する。今回のdesired_capacityは1なので、デプロイ中に一時的な停止が起き得る。
+  deployment_config_name = "CodeDeployDefault.OneAtATime"
+
+  auto_rollback_configuration {
+    enabled = true
+
+    events = [
+      "DEPLOYMENT_FAILURE"
+    ]
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.codedeploy_service_role,
+    aws_lb_listener.http,
+    aws_autoscaling_group.app
+  ]
+
+  tags = merge(local.common_tags, {
+    Name = "${local.name_prefix}-codedeploy-dg"
+  })
+}
+```
+
+---
+
+## 10-0-5. `codedeploy.tf` の解説
+
+## CodeDeploy Application
+
+```hcl id="kg1330"
+resource "aws_codedeploy_app" "app" {
+  name             = "${local.name_prefix}-app"
+  compute_platform = "Server"
+}
+```
+
+`compute_platform = "Server"` は、EC2 / オンプレミス向けの CodeDeploy Application であることを意味します。
+
+今回の対象は EC2 なので、`Server` を使います。
+
+---
+
+## CodeDeploy Deployment Group
+
+```hcl id="3uobii"
+resource "aws_codedeploy_deployment_group" "app" {
+  app_name              = aws_codedeploy_app.app.name
+  deployment_group_name = "${local.name_prefix}-dg"
+  service_role_arn     = aws_iam_role.codedeploy.arn
+}
+```
+
+Deployment Group は、どのEC2群に、どういう方式でデプロイするかを定義するリソースです。
+
+今回のデプロイ対象は Auto Scaling Group です。
+
+```hcl id="mw7syz"
+autoscaling_groups = [
+  aws_autoscaling_group.app.name
+]
+```
+
+---
+
+## in-place deployment
+
+```hcl id="2etj8s"
+deployment_style {
+  deployment_type   = "IN_PLACE"
+  deployment_option = "WITH_TRAFFIC_CONTROL"
+}
+```
+
+これは、既存EC2上でアプリを入れ替える構成です。
+
+`WITH_TRAFFIC_CONTROL` を使うことで、CodeDeploy が ALB Target Group と連携します。
+
+今回の構成では、デプロイ中に対象インスタンスが一時的に Target Group から外されることがあります。
+
+desired capacity が1台なので、デプロイ中に一時的にアクセスできない時間が出る可能性があります。
+
+これは、この段階では許容します。
+
+```text id="uiug9m"
+この段階:
+  in-place deployment の仕組みを理解する
+
+後続:
+  Blue/Green deployment で停止時間を小さくする
+```
+
+---
+
+## ALB Target Group との連携
+
+```hcl id="uclib2"
+load_balancer_info {
+  target_group_info {
+    name = aws_lb_target_group.app.name
+  }
+}
+```
+
+CodeDeploy が ALB Target Group と連携するための設定です。
+
+これにより、CodeDeploy はデプロイ対象インスタンスをロードバランサーの通信対象から外したり、完了後に戻したりできます。
+
+---
+
+## 自動ロールバック
+
+```hcl id="91yo5e"
+auto_rollback_configuration {
+  enabled = true
+
+  events = [
+    "DEPLOYMENT_FAILURE"
+  ]
+}
+```
+
+デプロイが失敗した場合に、自動ロールバックを試みます。
+
+ただし、これは「絶対に無停止で安全」という意味ではありません。
+
+特に in-place deployment では、既存EC2上でアプリを入れ替えるため、失敗の仕方によって一時的にアプリが止まることがあります。
+
+---
+
+## 10-0-6. CodeDeploy Agent の前提確認
+
+第8章の `asg.tf` の `user_data` で、EC2 起動時に CodeDeploy Agent を入れている必要があります。
+
+`aws_launch_template.app` の `user_data` に、最低限以下が含まれていることを確認してください。
+
+```bash id="l9qqev"
+dnf update -y
+dnf install -y ruby wget curl
+
+cd /tmp
+
+wget https://aws-codedeploy-${var.aws_region}.s3.${var.aws_region}.amazonaws.com/latest/install
+chmod +x ./install
+./install auto
+
+systemctl enable --now codedeploy-agent
+systemctl status codedeploy-agent --no-pager || true
+```
+
+この処理はローカルPCで実行するものではありません。
+
+```text id="wzxgsu"
+ローカルPC:
+  asg.tf に user_data として書く
+
+AWS:
+  EC2 起動時に cloud-init 経由で実行される
+```
+
+CodeDeploy Agent が入っていないと、CodeDeploy は EC2 上で `appspec.yml` や `scripts/*.sh` を実行できません。
+
+---
+
+## 10-0-7. ここで Terraform を実行する
+
+ここまでで、`outputs.tf` が参照していた CodeDeploy リソースも定義できました。
+
+そのため、このタイミングで初めて Terraform の確認と作成を行います。
+
+## 作業場所
+
+```text id="tbzjbz"
+ローカルPC
+```
+
+## 対象ディレクトリ
+
+```text id="buomjr"
+terraform-aws-cicd-tutorial/infra/
+```
+
+## 実行コマンド
+
+```bash id="vvatlg"
+cd infra
+terraform fmt
+terraform init
+terraform validate
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+## 確認する output
+
+```bash id="44bcew"
+terraform output
+```
+
+少なくとも以下が表示されることを確認します。
+
+```text id="rgm22d"
+alb_dns_name
+artifact_bucket
+codedeploy_app_name
+codedeploy_deployment_group_name
+github_actions_role_arn
+```
+
+個別に確認する場合は以下です。
+
+```bash id="zg5gto"
+terraform output -raw alb_dns_name
+terraform output -raw artifact_bucket
+terraform output -raw codedeploy_app_name
+terraform output -raw codedeploy_deployment_group_name
+terraform output -raw github_actions_role_arn
+```
+
+この時点では、ALB の URL にアクセスしてもアプリはまだ表示されない可能性があります。
+
+理由は、まだ GitHub Actions から v1 をデプロイしていないためです。
+
+```text id="6coo35"
+Terraform apply:
+  AWS基盤を作っただけ
+
+まだ未実施:
+  アプリv1のデプロイ
+```
+
+---
+
 # 11. GitHub Actions の CI/CD
 
 ## 11-1. この章でやること
 
 この章では、GitHub Actions の workflow を作ります。
 
+ただし、この章では **まだ push しません**。
+
+理由は、`main` ブランチへ push すると、GitHub Actions がすぐに動いて AWS へデプロイしようとするためです。
+
+この章では、以下だけを行います。
+
+```text id="tmefjo"
+1. GitHub Actions Variables を設定する
+2. appspec.yml を最終確認する
+3. ci-cd.yml を作成する
+4. ローカルで commit する
+5. push は第12章で行う
+```
+
+---
+
 ## 作業場所
 
-```text
+```text id="vmotsy"
 ローカルPC
 GitHub
 ```
 
 ## 対象ファイル
 
-```text
+```text id="9e4g22"
+deploy/appspec.yml
 .github/workflows/ci-cd.yml
 ```
 
 ## GitHub上で設定するもの
 
-```text
+```text id="ty6xus"
 Repository Variables
-```
-
-## この章で作る流れ
-
-```text
-Pull Request:
-  go test ./...
-
-main ブランチへの push:
-  go test ./...
-  go build
-  revision.zip 作成
-  S3へアップロード
-  CodeDeployを起動
 ```
 
 ---
@@ -2752,13 +3212,16 @@ main ブランチへの push:
 
 ## 作業場所
 
-```text
+```text id="46q3ap"
 GitHub
+ローカルPC
 ```
 
 ## 操作場所
 
-```text
+GitHub 上で、対象リポジトリを開きます。
+
+```text id="s4mq5o"
 GitHub Repository
   → Settings
   → Secrets and variables
@@ -2768,7 +3231,9 @@ GitHub Repository
 
 ## 作る Variables
 
-```text
+以下の4つを作ります。
+
+```text id="c0o6ep"
 AWS_GITHUB_ACTIONS_ROLE_ARN
 ARTIFACT_BUCKET
 CODEDEPLOY_APP_NAME
@@ -2779,7 +3244,7 @@ CODEDEPLOY_DEPLOYMENT_GROUP_NAME
 
 ローカルPCで Terraform output を確認します。
 
-```bash
+```bash id="zso9kw"
 cd infra
 
 terraform output -raw github_actions_role_arn
@@ -2788,63 +3253,277 @@ terraform output -raw codedeploy_app_name
 terraform output -raw codedeploy_deployment_group_name
 ```
 
-それぞれの出力値を GitHub の Variables に登録します。
+GitHub Variables に、以下の対応で登録します。
+
+```text id="70ghdd"
+AWS_GITHUB_ACTIONS_ROLE_ARN:
+  terraform output -raw github_actions_role_arn の値
+
+ARTIFACT_BUCKET:
+  terraform output -raw artifact_bucket の値
+
+CODEDEPLOY_APP_NAME:
+  terraform output -raw codedeploy_app_name の値
+
+CODEDEPLOY_DEPLOYMENT_GROUP_NAME:
+  terraform output -raw codedeploy_deployment_group_name の値
+```
 
 ここで登録するのは Secrets ではなく Variables で構いません。
-Role ARN や S3 バケット名は、パスワードそのものではないためです。
 
-ただし、AWS の長期アクセスキーは登録しません。
+これらはパスワードではないためです。
+
+ただし、以下は登録しません。
+
+```text id="y8ogc1"
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+```
+
+この教材では、GitHub Actions OIDC を使います。
 
 ---
 
-## 11-3. `ci-cd.yml` を作る
+## 11-3. `deploy/appspec.yml` を最終確認する
 
 ## 作業場所
 
-```text
+```text id="2q2s2c"
 ローカルPC
 ```
 
 ## 対象ファイル
 
-```text
-.github/workflows/ci-cd.yml
+```text id="5460y6"
+deploy/appspec.yml
 ```
 
 ## 目的
 
-GitHub Actions の workflow を定義します。
+CodeDeploy のリビジョン zip では、`appspec.yml` が zip のルートに置かれている必要があります。
 
-この workflow は、以下を行います。
+今回の zip は、後で GitHub Actions により以下のような構造になります。
 
-```text
-1. ソースを checkout
-2. Go をセットアップ
-3. go test ./...
-4. Go アプリをビルド
-5. CodeDeploy 用 zip を作成
-6. OIDC で AWS IAM Role を引き受ける
-7. zip を S3 にアップロード
-8. CodeDeploy deployment を作成
-9. deployment 成功を待つ
+```text id="vfextc"
+revision.zip
+├── appspec.yml
+├── app/
+│   └── tutorial-app
+└── scripts/
+    ├── install.sh
+    ├── start.sh
+    ├── stop.sh
+    └── validate.sh
 ```
 
-作成後、commit して push します。
+`deploy/appspec.yml` を以下の内容にします。
 
-```bash
-git add .github/workflows/ci-cd.yml
+```yaml id="o9fx6g"
+version: 0.0
+os: linux
+
+files:
+  - source: app
+    destination: /opt/tutorial-app
+
+file_exists_behavior: OVERWRITE
+
+hooks:
+  BeforeInstall:
+    - location: scripts/stop.sh
+      timeout: 60
+      runas: root
+
+  AfterInstall:
+    - location: scripts/install.sh
+      timeout: 120
+      runas: root
+
+  ApplicationStart:
+    - location: scripts/start.sh
+      timeout: 60
+      runas: root
+
+  ValidateService:
+    - location: scripts/validate.sh
+      timeout: 60
+      runas: root
+```
+
+`file_exists_behavior: OVERWRITE` は、デプロイ先に既存ファイルがある場合に上書きするための設定です。
+
+学習中に手動でファイルが残った場合や、再デプロイ時の失敗を減らすために入れています。
+
+---
+
+## 11-4. `ci-cd.yml` を作る
+
+## 作業場所
+
+```text id="5p4zdp"
+ローカルPC
+```
+
+## 対象ファイル
+
+```text id="625akt"
+.github/workflows/ci-cd.yml
+```
+
+## この workflow の動き
+
+```text id="cwwa6s"
+Pull Request:
+  go test ./...
+
+main ブランチへの push:
+  go test ./...
+  go build
+  revision.zip 作成
+  GitHub Actions OIDC で AWS Role を引き受ける
+  S3へ revision.zip をアップロード
+  CodeDeploy deployment を作成
+  deployment 成功を待つ
+```
+
+`.github/workflows/ci-cd.yml` を作成します。
+
+```yaml id="uu8fle"
+name: ci-cd
+
+on:
+  pull_request:
+    branches:
+      - main
+
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+
+      - name: Test
+        run: go test ./...
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: app/go.mod
+
+      - name: Build Linux binary
+        working-directory: app
+        run: |
+          GOOS=linux GOARCH=amd64 go build -o tutorial-app .
+
+      - name: Package CodeDeploy revision
+        run: |
+          rm -rf package revision.zip
+          mkdir -p package/app
+          cp app/tutorial-app package/app/tutorial-app
+          cp deploy/appspec.yml package/appspec.yml
+          cp -r deploy/scripts package/scripts
+          cd package
+          zip -r ../revision.zip .
+
+      - name: Configure AWS credentials with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check AWS caller identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Upload artifact to S3
+        run: |
+          aws s3 cp revision.zip \
+            s3://${{ vars.ARTIFACT_BUCKET }}/revisions/${{ github.sha }}.zip
+
+      - name: Create CodeDeploy deployment
+        run: |
+          DEPLOYMENT_ID=$(aws deploy create-deployment \
+            --application-name "${{ vars.CODEDEPLOY_APP_NAME }}" \
+            --deployment-group-name "${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP_NAME }}" \
+            --s3-location bucket=${{ vars.ARTIFACT_BUCKET }},key=revisions/${{ github.sha }}.zip,bundleType=zip \
+            --description "GitHub Actions deployment for commit ${{ github.sha }}" \
+            --query deploymentId \
+            --output text)
+
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> "$GITHUB_ENV"
+          echo "Created deployment: $DEPLOYMENT_ID"
+
+      - name: Wait for CodeDeploy deployment
+        run: |
+          aws deploy wait deployment-successful \
+            --deployment-id "$DEPLOYMENT_ID"
+```
+
+---
+
+## 11-5. この章では commit だけする
+
+この章では、まだ `git push` しません。
+push は第12章で行います。
+
+ローカルPCで以下を実行します。
+
+```bash id="f8i4m4"
+git add deploy/appspec.yml .github/workflows/ci-cd.yml
 git commit -m "add GitHub Actions CI/CD workflow"
-git push origin main
 ```
 
-## 確認する場所
+すでに commit 済みで変更がない場合は、commit は不要です。
 
-```text
-GitHub Repository
-  → Actions
+確認します。
+
+```bash id="624v5e"
+git status
 ```
 
-Actions が起動しているか確認します。
+まだ未pushのcommitがある状態で問題ありません。
+
+```text id="d8w7or"
+第11章:
+  workflowを作る
+  GitHub Variablesを設定する
+  commitする
+  まだpushしない
+
+第12章:
+  mainへpushしてv1をデプロイする
+```
 
 ---
 
@@ -2854,9 +3533,15 @@ Actions が起動しているか確認します。
 
 この章では、最初のアプリバージョンである v1 を AWS にデプロイします。
 
+ここで初めて、`main` ブランチへ push します。
+
+push すると、GitHub Actions が動き、CodeDeploy によって EC2 へアプリが配布されます。
+
+---
+
 ## 作業場所
 
-```text
+```text id="ij8zcj"
 ローカルPC
 GitHub
 AWS Console
@@ -2865,106 +3550,259 @@ AWS Console
 
 ## 対象ファイル
 
-```text
+```text id="6junz0"
 app/main.go
+app/main_test.go
+deploy/appspec.yml
+deploy/scripts/*.sh
+.github/workflows/ci-cd.yml
 ```
 
-## この章で実行する主な操作
+## 事前に完了している必要があるもの
 
-```text
-git commit
-git push
-GitHub Actions 確認
-CodeDeploy 確認
-ALB 経由でアプリ確認
+```text id="cnzb4t"
+Terraform apply が成功している
+GitHub Actions Variables を設定済み
+CodeDeploy Application / Deployment Group が作成済み
+ASG配下のEC2が起動している
+CodeDeploy Agent がEC2に入っている
 ```
 
 ---
 
 ## 12-2. v1 の状態を確認する
 
-`app/main.go` で、以下になっていることを確認します。
+`app/main.go` を確認します。
 
-```go
+```go id="ke33so"
 var version = "v1"
+```
+
+`/health` が正常に `OK` を返すことも確認します。
+
+```go id="1eorql"
+mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "OK")
+})
 ```
 
 ローカルPCでテストします。
 
-```bash
+```bash id="i1olpk"
 cd app
 go test ./...
 cd ..
 ```
 
+ローカルで起動確認してもよいです。
+
+```bash id="ngtseg"
+cd app
+go run main.go
+```
+
+別ターミナルで確認します。
+
+```bash id="maws6z"
+curl http://localhost:8080/
+curl http://localhost:8080/health
+curl http://localhost:8080/version
+```
+
+期待結果:
+
+```text id="5xw9xe"
+Hello from tutorial app v1
+OK
+v1
+```
+
+確認できたら、ローカルのアプリを停止します。
+
 ---
 
-## 12-3. main ブランチへ push する
+## 12-3. commit する
 
-ローカルPCで実行します。
+ローカルPCで、変更内容を確認します。
 
-```bash
-git add .
+```bash id="mhsgax"
+git status --short
+```
+
+まだ commit していないファイルがある場合は、commit します。
+
+```bash id="vdoblp"
+git add app deploy .github infra
+git reset infra/terraform.tfvars || true
 git commit -m "deploy app v1"
+```
+
+`infra/terraform.tfvars` は個人環境の値を含むため、Gitに入れない方針にしています。
+
+すでに commit 済みの場合は、以下のように表示されます。
+
+```text id="sye1jv"
+nothing to commit, working tree clean
+```
+
+その場合は、そのまま次へ進みます。
+
+---
+
+## 12-4. main ブランチへ push する
+
+ここで初めて push します。
+
+```bash id="v2h1su"
 git push origin main
 ```
 
+この push をきっかけに、GitHub Actions が起動します。
+
 ---
 
-## 12-4. 何が起きるか
+## 12-5. 何が起きるか
 
-`git push` を起点に、以下が自動実行されます。
+`git push` 後、以下が自動で実行されます。
 
-```text
+```text id="nd5g9c"
 1. GitHub Actions が起動する
-2. go test ./... が実行される
-3. Go アプリが Linux 用にビルドされる
-4. revision.zip が作成される
-5. revision.zip が S3 にアップロードされる
-6. CodeDeploy deployment が作成される
-7. EC2 上の CodeDeploy Agent が artifact を取得する
-8. EC2 上で appspec.yml が読まれる
-9. EC2 上で deploy/scripts/*.sh が実行される
-10. tutorial-app が systemd サービスとして起動する
+2. test job で go test ./... が実行される
+3. deploy job が開始される
+4. Goアプリが Linux 用にビルドされる
+5. revision.zip が作成される
+6. GitHub Actions が OIDC で AWS Role を引き受ける
+7. aws sts get-caller-identity でAWS接続を確認する
+8. revision.zip が S3 にアップロードされる
+9. CodeDeploy deployment が作成される
+10. EC2上のCodeDeploy Agentがrevision.zipを取得する
+11. appspec.yml に従って scripts/*.sh が実行される
+12. tutorial-app が systemd サービスとして起動する
+13. validate.sh が /health を確認する
+14. 成功すれば deployment が成功になる
 ```
 
 ---
 
-## 12-5. 確認する場所
+## 12-6. GitHub Actions を確認する
 
-## GitHub Actions
+## 作業場所
 
-```text
+```text id="on7atx"
+GitHub
+```
+
+## 操作場所
+
+```text id="5xb284"
 GitHub Repository
   → Actions
 ```
 
-workflow が成功していることを確認します。
+`ci-cd` workflow を開きます。
 
-## CodeDeploy
+以下を確認します。
 
-```text
+```text id="zl6fhe"
+test job が成功している
+deploy job が成功している
+Check AWS caller identity が成功している
+Upload artifact to S3 が成功している
+Wait for CodeDeploy deployment が成功している
+```
+
+もし `Configure AWS credentials with OIDC` で失敗した場合は、以下を確認します。
+
+```text id="2ud15o"
+GitHub Variables の AWS_GITHUB_ACTIONS_ROLE_ARN が正しいか
+github_owner / github_repo が terraform.tfvars と一致しているか
+main ブランチから実行しているか
+permissions に id-token: write があるか
+```
+
+---
+
+## 12-7. S3 artifact を確認する
+
+## 作業場所
+
+```text id="at60i9"
+AWS Console
+```
+
+## 操作場所
+
+```text id="9eljqk"
+AWS Console
+  → S3
+  → artifact bucket
+  → revisions/
+```
+
+以下のようなファイルがあることを確認します。
+
+```text id="jltvp8"
+revisions/<commit-sha>.zip
+```
+
+この zip が、CodeDeploy に渡されるアプリ成果物です。
+
+---
+
+## 12-8. CodeDeploy を確認する
+
+## 作業場所
+
+```text id="fz9os6"
+AWS Console
+```
+
+## 操作場所
+
+```text id="lzd8a2"
 AWS Console
   → CodeDeploy
   → Applications
   → 対象Application
+  → Deployment groups
   → Deployments
 ```
 
-deployment が成功していることを確認します。
+Deployment が `Succeeded` になっていることを確認します。
 
-## ALB
+失敗している場合は、Deployment の詳細画面を開きます。
 
-ローカルPCで確認します。
+よく見るポイントは以下です。
 
-```bash
+```text id="j3zys8"
+どの lifecycle event で失敗したか
+BeforeInstall か
+AfterInstall か
+ApplicationStart か
+ValidateService か
+```
+
+---
+
+## 12-9. ALB 経由で v1 を確認する
+
+## 作業場所
+
+```text id="zzh1do"
+ローカルPC
+ブラウザまたはcurl
+```
+
+ALB DNS名を確認します。
+
+```bash id="tt244t"
 cd infra
 terraform output -raw alb_dns_name
 ```
 
-ブラウザまたは curl で確認します。
+curl で確認します。
 
-```bash
+```bash id="rgket6"
 curl http://$(terraform output -raw alb_dns_name)/
 curl http://$(terraform output -raw alb_dns_name)/health
 curl http://$(terraform output -raw alb_dns_name)/version
@@ -2972,10 +3810,60 @@ curl http://$(terraform output -raw alb_dns_name)/version
 
 期待結果:
 
-```text
+```text id="gtpiu0"
 Hello from tutorial app v1
 OK
 v1
+```
+
+ブラウザでも確認できます。
+
+```text id="xfokdz"
+http://<alb-dns-name>/
+```
+
+---
+
+## 12-10. EC2 内で確認する場合
+
+必要に応じて、SSM Session Manager で EC2 に入って確認します。
+
+## 作業場所
+
+```text id="esxiry"
+AWS Console
+または
+ローカルPCのAWS CLI
+```
+
+AWS Console の場合:
+
+```text id="onlgc8"
+AWS Console
+  → Systems Manager
+  → Session Manager
+```
+
+EC2内で確認します。
+
+```bash id="rikckq"
+systemctl status tutorial-app --no-pager
+curl http://localhost:8080/health
+curl http://localhost:8080/version
+journalctl -u tutorial-app --no-pager -n 100
+```
+
+期待結果:
+
+```text id="lr8sgj"
+OK
+v1
+```
+
+CodeDeploy Agent のログを見る場合:
+
+```bash id="7n2ueb"
+sudo cat /var/log/aws/codedeploy-agent/codedeploy-agent.log
 ```
 
 ---
@@ -2986,9 +3874,26 @@ v1
 
 この章では、アプリを v1 から v2 に変更し、CI/CD によって自動デプロイされることを確認します。
 
+ここでは Terraform は実行しません。
+
+```text id="9ic9mm"
+Terraform:
+  実行しない
+
+GitHub Actions:
+  git push によって起動する
+
+CodeDeploy:
+  v2のartifactをEC2へ配布する
+```
+
+アプリのバージョンアップは、Terraform ではなく CI/CD の仕事です。
+
+---
+
 ## 作業場所
 
-```text
+```text id="q31cny"
 ローカルPC
 GitHub
 AWS Console
@@ -2997,7 +3902,7 @@ AWS Console
 
 ## 対象ファイル
 
-```text
+```text id="yyceqw"
 app/main.go
 ```
 
@@ -3009,31 +3914,60 @@ app/main.go
 
 変更前:
 
-```go
+```go id="vz8x5t"
 var version = "v1"
 ```
 
 変更後:
 
-```go
+```go id="k4vqxl"
 var version = "v2"
+```
+
+`/health` は正常なままにします。
+
+```go id="pjy1zs"
+mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "OK")
+})
 ```
 
 ---
 
 ## 13-3. ローカルでテストする
 
-```bash
+```bash id="aql5ra"
 cd app
 go test ./...
 cd ..
 ```
 
+必要ならローカルで起動確認します。
+
+```bash id="pzxmqt"
+cd app
+go run main.go
+```
+
+別ターミナルで確認します。
+
+```bash id="ff4hz3"
+curl http://localhost:8080/version
+```
+
+期待結果:
+
+```text id="2mv1m7"
+v2
+```
+
+確認できたら、ローカルのアプリを停止します。
+
 ---
 
 ## 13-4. commit / push する
 
-```bash
+```bash id="xbigza"
 git add app/main.go
 git commit -m "release app v2"
 git push origin main
@@ -3043,47 +3977,114 @@ git push origin main
 
 ## 13-5. 何が起きるか
 
-```text
+```text id="fe28b4"
 1. GitHub Actions が起動する
-2. テストが実行される
-3. v2 のバイナリがビルドされる
-4. v2 の revision.zip が S3 にアップロードされる
-5. CodeDeploy が v2 を EC2 に配布する
-6. ValidateService で /health が確認される
-7. 成功すれば deployment が成功になる
+2. go test ./... が実行される
+3. v2 のLinuxバイナリがビルドされる
+4. v2 の revision.zip が作られる
+5. S3 の revisions/<commit-sha>.zip にアップロードされる
+6. CodeDeploy deployment が作成される
+7. EC2 上で既存の tutorial-app が停止される
+8. v2 の tutorial-app が /opt/tutorial-app に配置される
+9. systemd で tutorial-app が再起動される
+10. ValidateService で /health が確認される
+11. 成功すれば deployment が成功になる
 ```
 
 ---
 
-## 13-6. 確認する場所
+## 13-6. GitHub Actions を確認する
 
-## GitHub Actions
-
-```text
+```text id="yndwur"
 GitHub Repository
   → Actions
+  → ci-cd
 ```
 
-## CodeDeploy
+以下を確認します。
 
-```text
+```text id="44fr8d"
+test 成功
+build 成功
+S3 upload 成功
+CodeDeploy deployment 作成成功
+deployment wait 成功
+```
+
+---
+
+## 13-7. CodeDeploy を確認する
+
+```text id="6azg7s"
 AWS Console
   → CodeDeploy
+  → Applications
+  → 対象Application
   → Deployments
 ```
 
-## ALB 経由で確認
+新しい Deployment が `Succeeded` になっていることを確認します。
 
-```bash
+---
+
+## 13-8. ALB 経由で v2 を確認する
+
+ローカルPCで実行します。
+
+```bash id="wq7tdq"
 cd infra
 curl http://$(terraform output -raw alb_dns_name)/version
 ```
 
 期待結果:
 
-```text
+```text id="ddsd3s"
 v2
 ```
+
+トップページも確認します。
+
+```bash id="h76oc0"
+curl http://$(terraform output -raw alb_dns_name)/
+```
+
+期待結果:
+
+```text id="2pcjt2"
+Hello from tutorial app v2
+```
+
+これで、アプリの v1 → v2 バージョンアップを CI/CD で流せました。
+
+---
+
+## 13-9. この章で理解すべきこと
+
+この章で重要なのは、以下です。
+
+```text id="d2jrju"
+アプリコード変更:
+  app/main.go
+
+デプロイ開始:
+  git push
+
+テスト・ビルド:
+  GitHub Actions
+
+成果物保存:
+  S3
+
+EC2への配布:
+  CodeDeploy
+
+インフラ変更:
+  していない
+```
+
+つまり、v1 → v2 のアプリ更新で `terraform apply` は実行していません。
+
+これが、Terraform と CI/CD の役割分担です。
 
 ---
 
@@ -3091,11 +4092,23 @@ v2
 
 ## 14-1. この章でやること
 
-この章では、アプリの health check をわざと壊し、デプロイ失敗がどこで検知されるか確認します。
+この章では、アプリの health check をわざと壊して、デプロイ失敗がどこで検知されるか確認します。
+
+目的は、以下を体験することです。
+
+```text id="y8m8qw"
+テストだけでは検知できない問題がある
+デプロイ後のhealth checkが重要
+CodeDeployのValidateServiceで失敗を検知できる
+失敗時にGitHub Actionsも失敗になる
+auto rollbackが動く可能性がある
+```
+
+---
 
 ## 作業場所
 
-```text
+```text id="nsszi1"
 ローカルPC
 GitHub
 AWS Console
@@ -3104,7 +4117,7 @@ AWS Console
 
 ## 対象ファイル
 
-```text
+```text id="m5256u"
 app/main.go
 ```
 
@@ -3112,30 +4125,34 @@ app/main.go
 
 ## 14-2. 重要な注意
 
-通常の in-place デプロイと Blue/Green デプロイでは、失敗時の影響が異なります。
+この章は、まだ in-place deployment の段階です。
 
-```text
-通常の in-place デプロイ:
+```text id="jyipz0"
+in-place deployment:
   既存EC2上でアプリを入れ替える
-  失敗の仕方によっては、一時的にアプリが止まる可能性がある
 
-Blue/Green デプロイ:
+Blue/Green deployment:
   新しい環境にデプロイしてから切り替える
-  health check に失敗した場合、本番切り替えを防ぎやすい
 ```
 
-したがって、Blue/Green を導入する前の段階では、
-「失敗しても必ず v1 が無傷で残る」とは言い切りません。
+今回の in-place deployment では、デプロイ失敗時に CodeDeploy の rollback を設定しています。
 
-この章の目的は、まず以下を理解することです。
+ただし、in-place では既存EC2上でアプリを入れ替えるため、失敗の仕方によっては一時的にアプリが止まる可能性があります。
 
-```text
-health check が壊れる
-  ↓
-ValidateService が失敗する
-  ↓
-CodeDeploy が deployment 失敗として検知する
+したがって、ここでは次のように理解します。
+
+```text id="9cvfni"
+正しい理解:
+  失敗を検知できる
+  rollbackを試みられる
+  ただし無停止を保証するものではない
+
+間違った理解:
+  CodeDeployなら必ず無停止
+  CodeDeployなら必ず本番影響ゼロ
 ```
+
+無停止に近づける設計は、後続の Blue/Green で扱います。
 
 ---
 
@@ -3145,7 +4162,7 @@ CodeDeploy が deployment 失敗として検知する
 
 変更前:
 
-```go
+```go id="2y752z"
 mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "OK")
 })
@@ -3153,17 +4170,62 @@ mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 
 変更後:
 
-```go
+```go id="e6r9kt"
 mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 	http.Error(w, "NG", http.StatusInternalServerError)
 })
 ```
 
+この変更により、アプリは起動しますが、`/health` は HTTP 500 を返します。
+
 ---
 
-## 14-4. commit / push する
+## 14-4. ローカルで確認する
 
-```bash
+ローカルでテストします。
+
+```bash id="k06ipx"
+cd app
+go test ./...
+```
+
+このテストは成功する可能性があります。
+
+理由は、現在の `main_test.go` は `version` が空でないことしか見ていないためです。
+
+```text id="glry3r"
+go test:
+  成功する可能性がある
+
+/health:
+  実行時には失敗する
+```
+
+ローカルで起動して確認します。
+
+```bash id="3k1qv9"
+go run main.go
+```
+
+別ターミナルで確認します。
+
+```bash id="akotyq"
+curl -i http://localhost:8080/health
+```
+
+期待結果:
+
+```text id="rk001f"
+HTTP/1.1 500 Internal Server Error
+```
+
+確認できたら、ローカルのアプリを停止します。
+
+---
+
+## 14-5. commit / push する
+
+```bash id="tixpcm"
 git add app/main.go
 git commit -m "break health check"
 git push origin main
@@ -3171,58 +4233,204 @@ git push origin main
 
 ---
 
-## 14-5. 何が起きるか
+## 14-6. 何が起きるか
 
-```text
+```text id="7vknbn"
 1. GitHub Actions が起動する
 2. go test は成功する可能性がある
 3. アプリがビルドされる
-4. revision.zip が S3 にアップロードされる
-5. CodeDeploy がデプロイを開始する
-6. EC2 上で validate.sh が実行される
-7. /health が HTTP 500 を返す
-8. ValidateService が失敗する
-9. CodeDeploy deployment が失敗になる
+4. revision.zip がS3にアップロードされる
+5. CodeDeploy deployment が作成される
+6. EC2上でアプリが入れ替わる
+7. ApplicationStart でアプリは起動する
+8. ValidateService で validate.sh が実行される
+9. validate.sh が /health を確認する
+10. /health がHTTP 500を返す
+11. ValidateService が失敗する
+12. CodeDeploy deployment が失敗になる
+13. GitHub Actions の Wait for CodeDeploy deployment も失敗になる
+14. auto rollback が有効なら、前回成功したrevisionへのrollbackを試みる
 ```
 
 ---
 
-## 14-6. 確認する場所
+## 14-7. GitHub Actions の失敗を確認する
 
-## GitHub Actions
-
-```text
+```text id="u76q86"
 GitHub Repository
   → Actions
+  → failed workflow
 ```
 
-## CodeDeploy
+`Wait for CodeDeploy deployment` が失敗していることを確認します。
 
-```text
+これは期待通りです。
+
+```text id="q97goh"
+この章では失敗させるのが目的
+```
+
+---
+
+## 14-8. CodeDeploy の失敗を確認する
+
+```text id="exnkhz"
 AWS Console
   → CodeDeploy
+  → Applications
+  → 対象Application
   → Deployments
-  → failed deployment
 ```
 
-## EC2ログ
+失敗した Deployment を開きます。
+
+確認するポイントは以下です。
+
+```text id="6aoy37"
+失敗した lifecycle event:
+  ValidateService
+
+実行された script:
+  scripts/validate.sh
+
+失敗理由:
+  /health がHTTP 200を返さなかった
+```
+
+---
+
+## 14-9. EC2内のログを確認する
 
 必要に応じて、SSM Session Manager で EC2 に入ります。
 
-```text
+```text id="qz9duy"
 AWS Console
   → Systems Manager
   → Session Manager
 ```
 
-EC2 内で確認します。
+EC2内で確認します。
 
-```bash
+```bash id="9sary2"
+systemctl status tutorial-app --no-pager
 journalctl -u tutorial-app --no-pager -n 100
-cat /var/log/aws/codedeploy-agent/codedeploy-agent.log
+sudo cat /var/log/aws/codedeploy-agent/codedeploy-agent.log
+```
+
+アプリ自体は起動しているが、`/health` が失敗している可能性があります。
+
+```bash id="09hsrh"
+curl -i http://localhost:8080/health
+curl -i http://localhost:8080/version
 ```
 
 ---
+
+## 14-10. rollback 後の状態を確認する
+
+第13章で v2 のデプロイが成功していた場合、CodeDeploy は失敗時に前回成功した revision への rollback を試みます。
+
+ALB 経由で確認します。
+
+```bash id="a25tuw"
+cd infra
+curl http://$(terraform output -raw alb_dns_name)/version
+curl -i http://$(terraform output -raw alb_dns_name)/health
+```
+
+期待される状態は、前回成功した v2 に戻っていることです。
+
+```text id="x2hk8e"
+version:
+  v2
+
+health:
+  HTTP 200 / OK
+```
+
+ただし、rollback にも失敗した場合は、手動で正常版を再デプロイする必要があります。
+
+---
+
+## 14-11. 正常版に戻す
+
+壊した `/health` を元に戻します。
+
+`app/main.go` を編集します。
+
+```go id="ec0hlq"
+mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	fmt.Fprintln(w, "OK")
+})
+```
+
+version は v2 のままで構いません。
+
+```go id="jmj5au"
+var version = "v2"
+```
+
+ローカルで確認します。
+
+```bash id="sfhkfh"
+cd app
+go test ./...
+cd ..
+```
+
+commit / push します。
+
+```bash id="brim7i"
+git add app/main.go
+git commit -m "restore health check"
+git push origin main
+```
+
+GitHub Actions と CodeDeploy が成功することを確認します。
+
+最後に ALB 経由で確認します。
+
+```bash id="358xlk"
+cd infra
+curl http://$(terraform output -raw alb_dns_name)/health
+curl http://$(terraform output -raw alb_dns_name)/version
+```
+
+期待結果:
+
+```text id="cdlyri"
+OK
+v2
+```
+
+---
+
+## 14-12. この章で理解すべきこと
+
+この章で重要なのは、以下です。
+
+```text id="df3fia"
+CIのテストだけでは、実行時のhealth check不良を検知できないことがある。
+
+CodeDeployのValidateServiceで、デプロイ後の実行時確認ができる。
+
+in-place deploymentでは、失敗検知やrollbackはできるが、
+無停止を保証するわけではない。
+
+Blue/Green deploymentは、
+新環境で検証してから切り替えるための次のステップである。
+```
+
+つまり、この章は Blue/Green の必要性を理解するための前段です。
+
+```text id="lg9ht0"
+in-placeで失敗を体験する
+  ↓
+なぜBlue/Greenが必要か理解する
+  ↓
+後続章でBlue/Greenを学ぶ
+```
+
 
 # 15. Blue/Green デプロイの説明
 
